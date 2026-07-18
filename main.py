@@ -413,8 +413,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.warning(f"Image send failed: {e}")
-        await update.message.reply_text("
-        ****", parse_mode="Markdown")
+        await update.message.reply_text(" ****", parse_mode="Markdown")
 
     # Show menu if authorized
     if await is_authorized(update.effective_user.id):
