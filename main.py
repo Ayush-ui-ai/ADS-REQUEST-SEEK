@@ -45,13 +45,13 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-type', 'application/json')
         self.end_headers()
         self.wfile.write(json.dumps({"status": "alive"}).encode())
-    def log_message(self, format, *args):
+    def log_message(self, *args):
         pass
 
 def run_health_server(port):
     try:
         with socketserver.TCPServer(("0.0.0.0", port), HealthHandler) as httpd:
-            logger.info(f"Health server on port {port}")
+            logger.info(f"✅ Health server on port {port}")
             httpd.serve_forever()
     except Exception as e:
         logger.error(f"Health server error: {e}")
@@ -79,7 +79,6 @@ async def init_db():
                 account_phone TEXT
             )
         ''')
-        # NEW: user state table (for button flow)
         await db.execute('''
             CREATE TABLE IF NOT EXISTS user_state (
                 user_id INTEGER PRIMARY KEY,
@@ -89,14 +88,11 @@ async def init_db():
         ''')
         await db.commit()
 
-# ---------- STATE MANAGEMENT (DATABASE) ----------
 async def set_state(user_id, state, data=None):
     async with aiosqlite.connect(DB_PATH) as db:
         data_str = json.dumps(data) if data else None
-        await db.execute(
-            'INSERT OR REPLACE INTO user_state (user_id, state, data) VALUES (?, ?, ?)',
-            (user_id, state, data_str)
-        )
+        await db.execute('INSERT OR REPLACE INTO user_state (user_id, state, data) VALUES (?, ?, ?)',
+                         (user_id, state, data_str))
         await db.commit()
 
 async def get_state(user_id):
@@ -116,8 +112,7 @@ async def clear_state(user_id):
 async def get_owners():
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute('SELECT user_id FROM owners')
-        rows = await cursor.fetchall()
-        return [row[0] for row in rows] if rows else []
+        return [r[0] for r in await cursor.fetchall()]
 
 async def is_owner(user_id):
     return user_id in await get_owners()
@@ -156,7 +151,8 @@ async def list_admins():
 
 async def add_account_db(phone, session_string):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('INSERT OR REPLACE INTO accounts (phone_number, session_string) VALUES (?, ?)', (phone, session_string))
+        await db.execute('INSERT OR REPLACE INTO accounts (phone_number, session_string) VALUES (?, ?)',
+                         (phone, session_string))
         await db.commit()
 
 async def get_all_accounts():
@@ -174,6 +170,19 @@ async def get_activity_log(limit=50):
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute('SELECT timestamp, action, target, account_phone FROM activity_log ORDER BY timestamp DESC LIMIT ?', (limit,))
         return await cursor.fetchall()
+
+# ---------- CANCEL FLAG (Global) ----------
+# user_id -> True if cancel requested
+cancel_flags = {}
+
+def request_cancel(user_id):
+    cancel_flags[user_id] = True
+
+def is_cancelled(user_id):
+    return cancel_flags.get(user_id, False)
+
+def clear_cancel(user_id):
+    cancel_flags.pop(user_id, None)
 
 # ---------- ACCOUNT MANAGER ----------
 class AccountManager:
@@ -198,19 +207,18 @@ class AccountManager:
                 await client(JoinChannelRequest(entity))
                 return True, f"✅ joined @{username}"
         except errors.FloodWaitError as e:
-            return False, f"⏳ flood wait {e.seconds}s"
+            return False, f"⏳ flood {e.seconds}s"
         except Exception as e:
             err = str(e).lower()
             if "successfully requested" in err:
                 return True, "✅ join request sent"
             if "authorization key" in err and "different ip" in err:
-                return False, "❌ Session invalid. Re-add account."
+                return False, "❌ Session invalid."
             return False, f"❌ {str(e)}"
 
     async def _keep_online_for_1hour(self, client, phone):
         try:
             await client(UpdateStatusRequest(offline=False))
-            logger.info(f"🟢 {phone} online")
         except:
             pass
         start = asyncio.get_event_loop().time()
@@ -222,7 +230,6 @@ class AccountManager:
                 pass
         try:
             await client(UpdateStatusRequest(offline=True))
-            logger.info(f"⏰ {phone} offline")
         except:
             pass
         if phone in self.online_tasks:
@@ -242,19 +249,24 @@ class AccountManager:
                 self.clients[phone] = client
                 logger.info(f"✅ {phone} connected")
             else:
-                logger.warning(f"⚠️ {phone} not authorized")
+                logger.warning(f"⚠️ {phone} not auth")
         except Exception as e:
-            logger.error(f"❌ {phone} error: {e}")
+            logger.error(f"❌ {phone}: {e}")
 
     async def add_new_account(self, phone, session_str):
         await add_account_db(phone, session_str)
         await self._add_client(phone, session_str)
 
-    async def join_and_go_online(self, invite_link, delay, count, progress_callback=None):
+    async def join_and_go_online(self, user_id, invite_link, delay, count, progress_callback=None):
+        """Join process with cancel support."""
+        clear_cancel(user_id)
+
         all_phones = list(self.clients.keys())
         if count > len(all_phones):
-            return [f"❌ Only {len(all_phones)} accounts."], []
+            count = len(all_phones)
         selected = all_phones[:count]
+
+        # Start online timers
         for phone in selected:
             if phone in self.online_tasks:
                 self.online_tasks[phone].cancel()
@@ -264,7 +276,14 @@ class AccountManager:
         results = []
         success = []
         total = len(selected)
+        cancelled = False
+
         for idx, phone in enumerate(selected):
+            if is_cancelled(user_id):
+                cancelled = True
+                results.append("🛑 **Cancelled by user**")
+                break
+
             client = self.clients[phone]
             ok, msg = await self._join_channel(client, invite_link)
             if ok:
@@ -273,13 +292,27 @@ class AccountManager:
                 results.append(f"✅ {phone}: {msg}")
             else:
                 results.append(f"❌ {phone}: {msg}")
+
             if progress_callback:
-                await progress_callback(idx+1, total, len(success), idx+1 - len(success))
+                await progress_callback(idx + 1, total, len(success), idx + 1 - len(success))
+
             if idx < total - 1 and delay > 0:
-                await asyncio.sleep(delay)
-        for phone in selected:
-            results.append(f"🟢 {phone} ONLINE for 1 hour")
-        results.append(f"\n📊 Requested: {count} | Joined: {len(success)}")
+                # Break delay into chunks so cancel is responsive
+                for _ in range(delay):
+                    if is_cancelled(user_id):
+                        cancelled = True
+                        break
+                    await asyncio.sleep(1)
+                if cancelled:
+                    results.append("🛑 **Cancelled by user**")
+                    break
+
+        if cancelled:
+            results.append(f"\n📊 Stopped at: {len(success)} joined / {total} requested")
+        else:
+            results.append(f"\n📊 Total: {total} | Joined: {len(success)}")
+
+        clear_cancel(user_id)
         return results, success
 
     async def leave_specific(self, entity_input):
@@ -303,10 +336,10 @@ class AccountManager:
                     if dialog.is_channel or dialog.is_group:
                         try:
                             await client(LeaveChannelRequest(dialog.entity))
-                            results.append(f"✅ left {dialog.name}")
+                            results.append(f"✅ {dialog.name}")
                         except:
                             pass
-                all_results.append(f"📱 {phone}:\n" + ("\n".join(results) if results else "nothing to leave."))
+                all_results.append(f"📱 {phone}: " + (", ".join(results) if results else "nothing"))
             except Exception as e:
                 all_results.append(f"❌ {phone}: {str(e)}")
         return all_results
@@ -325,7 +358,7 @@ is_processing = False
 reaction_queue = asyncio.Queue()
 is_reaction_processing = False
 
-# ---------- AUTHORIZATION DECORATORS ----------
+# ---------- AUTH DECORATORS ----------
 def authorized_only(func):
     async def wrapper(update, context):
         if update.callback_query:
@@ -356,14 +389,14 @@ def owner_only(func):
     return wrapper
 
 # ---------- HELPERS ----------
-async def send_long_message(target, text):
+async def send_long(target, text):
     if not text:
         return
     reply = target.message.reply_text if hasattr(target, 'message') else target.reply_text
     for i in range(0, len(text), 4000):
         await reply(text[i:i+4000])
 
-async def update_progress_message(message, current, total, success, failed):
+async def update_progress(message, current, total, success, failed):
     percent = int((current / total) * 100) if total else 0
     filled = int(20 * current / total) if total else 0
     bar = "█" * filled + "░" * (20 - filled)
@@ -380,18 +413,29 @@ async def update_progress_message(message, current, total, success, failed):
         except:
             pass
 
+def cancel_keyboard():
+    """Return keyboard with Cancel button."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel", callback_data="cancel_task")]])
+
 # ---------- PROCESSORS ----------
 async def process_join_queue():
     global is_processing
     is_processing = True
     while not task_queue.empty():
-        update, link, delay, count, original_msg = await task_queue.get()
+        update, user_id, link, delay, count, original_msg = await task_queue.get()
         try:
-            progress_msg = await original_msg.reply_text("🔄 Starting join...")
+            progress_msg = await original_msg.reply_text(
+                "🔄 Starting join requests...",
+                reply_markup=cancel_keyboard()
+            )
             async def cb(cur, total, succ, fail):
-                await update_progress_message(progress_msg, cur, total, succ, fail)
-            result_list, _ = await account_manager.join_and_go_online(link, delay, count, cb)
-            await send_long_message(update, "\n".join(result_list))
+                await update_progress(progress_msg, cur, total, succ, fail)
+            result_list, _ = await account_manager.join_and_go_online(user_id, link, delay, count, cb)
+            try:
+                await progress_msg.edit_reply_markup(reply_markup=None)
+            except:
+                pass
+            await send_long(update, "\n".join(result_list))
         except Exception as e:
             try:
                 await update.message.reply_text(f"❌ Failed: {str(e)}")
@@ -416,7 +460,7 @@ async def process_reaction_queue():
                 try:
                     channel_id = int(channel_part)
                 except:
-                    await original_msg.reply_text("❌ Invalid channel ID.")
+                    await original_msg.reply_text("❌ Invalid channel.")
                     continue
                 channel_ids = [channel_id, -1000000000000 - channel_id, -100 + channel_id]
             else:
@@ -443,14 +487,12 @@ async def process_reaction_queue():
                     await client(SendReactionRequest(peer=entity, msg_id=message_id,
                                                      reaction=[ReactionEmoji(emoticon=emoji)]))
                     success += 1
-                except Exception as e:
+                except:
                     failed += 1
                 await asyncio.sleep(0.5)
                 if current % 5 == 0 or current == total:
-                    await update_progress_message(progress_msg, current, total, success, failed)
-            await original_msg.reply_text(
-                f"✅ **Done**\nTotal: {total}\nSuccess: {success}\nFailed: {failed}\nEmoji: {emoji}"
-            )
+                    await update_progress(progress_msg, current, total, success, failed)
+            await original_msg.reply_text(f"✅ Done!\nTotal: {total}\nSuccess: {success}\nFailed: {failed}\nEmoji: {emoji}")
         except Exception as e:
             try:
                 await original_msg.reply_text(f"❌ {e}")
@@ -494,7 +536,7 @@ async def main_menu(update, context):
         owners = await get_owners()
         owners_list = "\n".join([f"• `{o}`" for o in owners])
         admin_list = "\n".join([f"• `{a}` ({u or '?'})" for a, u in admins])
-        status += f"\n👑 **Owners**\n{owners_list}\n**Admins**\n{admin_list}\n/addowner <id>\n/addadmin <id>"
+        status += f"\n👑 **Owners**\n{owners_list}\n**Admins**\n{admin_list}"
 
     keyboard = [
         [InlineKeyboardButton("➕ Add New Account", callback_data="add_account")],
@@ -502,9 +544,8 @@ async def main_menu(update, context):
          InlineKeyboardButton("🚪 Leaver Mode", callback_data="leaver_mode")],
         [InlineKeyboardButton("📋 List Accounts", callback_data="list_accounts"),
          InlineKeyboardButton("📜 Activity Log", callback_data="activity_log")],
-        [InlineKeyboardButton("💬 Engagement", callback_data="engagement"),
-         InlineKeyboardButton("⚡ Start Mass", callback_data="start_mass")],
-        [InlineKeyboardButton("🎯 React to Post", callback_data="reaction_only")]
+        [InlineKeyboardButton("🎯 React to Post", callback_data="reaction_only")],
+        [InlineKeyboardButton("🛑 Cancel Running Task", callback_data="cancel_task")]
     ]
     await update.message.reply_text(status, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
@@ -515,37 +556,51 @@ async def button_handler(update, context):
     data = query.data
     uid = update.effective_user.id
 
+    # ====== CANCEL BUTTON (works anywhere) ======
+    if data == "cancel_task":
+        request_cancel(uid)
+        await clear_state(uid)
+        await query.message.reply_text("🛑 **Cancel requested.** Running task will stop shortly.")
+        return
+
     if data == "add_account":
         await set_state(uid, "add_phone")
-        await query.message.reply_text("📱 Send phone number with country code:\nExample: +1234567890")
+        await query.message.reply_text(
+            "📱 **Send phone number with country code:**\nExample: `+1234567890`",
+            parse_mode="Markdown",
+            reply_markup=cancel_keyboard()
+        )
     elif data == "joiner_mode":
         await set_state(uid, "join_link")
         await query.message.reply_text(
-            "🔗 **Joiner Mode – Step 1 of 3**\n"
-            "Send the **channel link** (e.g., `https://t.me/+abc123` or `@username`)\n\n"
-            "_(Ya fir aap direct `/join <link> <delay> <count>` bhi use kar sakte ho)_",
-            parse_mode="Markdown"
+            "🔗 **Joiner Mode – Step 1 of 3**\n\n"
+            "**Send the channel link:**\n"
+            "Example: `https://t.me/+abc123` or `@username`",
+            parse_mode="Markdown",
+            reply_markup=cancel_keyboard()
         )
     elif data == "leaver_mode":
         await clear_state(uid)
-        await query.message.reply_text("🚪 Send `/leave <link>` for specific channel\nOr `/leave` for all channels")
+        await query.message.reply_text(
+            "🚪 Send `/leave <link>` for specific channel\nOr `/leave` for all channels",
+            parse_mode="Markdown"
+        )
     elif data == "list_accounts":
         accs = await account_manager.get_accounts_list()
-        txt = "📱 Accounts:\n" + "\n".join(accs) if accs else "No accounts."
-        await send_long_message(query.message, txt)
+        txt = "📱 **Accounts:**\n" + "\n".join(accs) if accs else "No accounts."
+        await send_long(query.message, txt)
     elif data == "activity_log":
         logs = await get_activity_log(10)
-        txt = "📜 Logs:\n" + "\n".join(f"{ts} | {a} | {t}" for ts, a, t, _ in logs) if logs else "No activity."
-        await send_long_message(query.message, txt)
-    elif data == "engagement":
-        await query.message.reply_text("💬 Coming soon.")
-    elif data == "start_mass":
-        await query.message.reply_text("⚡ Use Joiner Mode.")
+        txt = "📜 **Logs:**\n" + "\n".join(f"{ts} | {a} | {t}" for ts, a, t, _ in logs) if logs else "No activity."
+        await send_long(query.message, txt)
     elif data == "reaction_only":
         await set_state(uid, "reaction_link")
-        await query.message.reply_text("🎯 Send the **post link** (e.g., `https://t.me/username/123`)")
+        await query.message.reply_text(
+            "🎯 **Send the post link:**\nExample: `https://t.me/username/123`",
+            parse_mode="Markdown",
+            reply_markup=cancel_keyboard()
+        )
     elif data.startswith("emoji_"):
-        # Handled in text handler state
         emoji = data.split("_", 1)[1]
         _, state_data = await get_state(uid)
         post_link = state_data.get('post_link')
@@ -554,27 +609,25 @@ async def button_handler(update, context):
             return
         if emoji == "custom":
             await set_state(uid, "reaction_emoji", state_data)
-            await query.message.reply_text("📝 Type the emoji you want:")
+            await query.message.reply_text("📝 Type the emoji:", reply_markup=cancel_keyboard())
             return
         await reaction_queue.put((update, post_link, emoji, query.message))
         if not is_reaction_processing:
             asyncio.create_task(process_reaction_queue())
         await clear_state(uid)
         await query.message.reply_text(f"✅ Queued {emoji} reactions.")
-    return
 
-# ---------- TEXT MESSAGE HANDLER (State Machine) ----------
+# ---------- TEXT HANDLER (State Machine) ----------
 async def text_handler(update, context):
     uid = update.effective_user.id
     text = update.message.text.strip()
 
-    # Check authorization first
     if not await is_authorized(uid):
         return
 
     state, state_data = await get_state(uid)
 
-    # ---- Add Account ----
+    # ===== Add Account Flow =====
     if state == "add_phone":
         if not text.startswith('+'):
             await update.message.reply_text("❌ Must start with '+'.")
@@ -586,7 +639,7 @@ async def text_handler(update, context):
             await client.send_code_request(text)
             state_data['temp_client'] = client
             await set_state(uid, "add_code", state_data)
-            await update.message.reply_text("✅ Enter the verification code:")
+            await update.message.reply_text("✅ Enter the verification code:", reply_markup=cancel_keyboard())
         except Exception as e:
             await update.message.reply_text(f"❌ {e}")
             await clear_state(uid)
@@ -604,7 +657,7 @@ async def text_handler(update, context):
             await clear_state(uid)
         except errors.SessionPasswordNeededError:
             await set_state(uid, "add_password", state_data)
-            await update.message.reply_text("🔐 Enter your 2FA password:")
+            await update.message.reply_text("🔐 Enter 2FA password:", reply_markup=cancel_keyboard())
         except Exception as e:
             await update.message.reply_text(f"❌ {e}")
             await clear_state(uid)
@@ -624,14 +677,24 @@ async def text_handler(update, context):
         await clear_state(uid)
         return
 
-    # ---- Joiner Mode Flow ----
+    # ===== Joiner Mode Flow (3 steps) =====
     if state == "join_link":
-        if not re.match(r'(https?://t\.me/|@)', text):
-            await update.message.reply_text("❌ Invalid link. Send as `https://t.me/+abc123` or `@username`", parse_mode="Markdown")
+        if not (text.startswith("https://t.me/") or text.startswith("@") or text.startswith("t.me/")):
+            await update.message.reply_text(
+                "❌ Invalid link. Send as `https://t.me/+abc123` or `@username`",
+                parse_mode="Markdown",
+                reply_markup=cancel_keyboard()
+            )
             return
         state_data['link'] = text
         await set_state(uid, "join_delay", state_data)
-        await update.message.reply_text("**Step 2 of 3** ✅ Link saved.\n\nNow send **delay in seconds** (e.g., `10`):", parse_mode="Markdown")
+        await update.message.reply_text(
+            "✅ **Link saved.**\n\n"
+            "**Step 2 of 3 – Send delay in seconds:**\n"
+            "Example: `10` (10 seconds between each join request)",
+            parse_mode="Markdown",
+            reply_markup=cancel_keyboard()
+        )
         return
 
     if state == "join_delay":
@@ -640,37 +703,62 @@ async def text_handler(update, context):
             if delay < 0:
                 raise ValueError
         except:
-            await update.message.reply_text("❌ Send a positive number.")
+            await update.message.reply_text("❌ Send a positive number.", reply_markup=cancel_keyboard())
             return
         state_data['delay'] = delay
+        total_accounts = await account_manager.get_active_sessions()
         await set_state(uid, "join_count", state_data)
-        await update.message.reply_text("**Step 3 of 3** ✅ Delay saved.\n\nNow send **number of accounts** to use (e.g., `5`):", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"✅ **Delay saved: {delay}s**\n\n"
+            f"**Step 3 of 3 – How many accounts?**\n"
+            f"• Send a number (e.g., `10`)\n"
+            f"• Or send `all` to use **all {total_accounts} accounts**",
+            parse_mode="Markdown",
+            reply_markup=cancel_keyboard()
+        )
         return
 
     if state == "join_count":
-        try:
-            count = int(text)
-            if count <= 0:
-                raise ValueError
-        except:
-            await update.message.reply_text("❌ Send a positive integer.")
-            return
+        total_accounts = await account_manager.get_active_sessions()
+        if text.lower() == "all":
+            count = total_accounts
+        else:
+            try:
+                count = int(text)
+                if count <= 0:
+                    raise ValueError
+                if count > total_accounts:
+                    count = total_accounts
+            except:
+                await update.message.reply_text(
+                    f"❌ Send a positive number or `all` (available: {total_accounts})",
+                    parse_mode="Markdown",
+                    reply_markup=cancel_keyboard()
+                )
+                return
+
         link = state_data['link']
         delay = state_data['delay']
-        total = await account_manager.get_active_sessions()
-        if count > total:
-            count = total
-        await task_queue.put((update, link, delay, count, update.message))
+
+        await clear_state(uid)
+        await task_queue.put((update, uid, link, delay, count, update.message))
         if not is_processing:
             asyncio.create_task(process_join_queue())
-        await clear_state(uid)
-        await update.message.reply_text(f"✅ **Task queued!**\n{count} accounts will join with {delay}s delay.")
+        await update.message.reply_text(
+            f"✅ **Task queued!**\n"
+            f"• Accounts: `{count}`\n"
+            f"• Delay: `{delay}s`\n"
+            f"• Link: `{link}`\n\n"
+            f"Click 🛑 Cancel to stop it.",
+            parse_mode="Markdown",
+            reply_markup=cancel_keyboard()
+        )
         return
 
-    # ---- Reaction Flow ----
+    # ===== Reaction Flow =====
     if state == "reaction_link":
         if not re.match(r'https://t\.me/(c/)?[^/]+/\d+', text):
-            await update.message.reply_text("❌ Invalid post link.")
+            await update.message.reply_text("❌ Invalid post link.", reply_markup=cancel_keyboard())
             return
         state_data['post_link'] = text
         await set_state(uid, "reaction_emoji", state_data)
@@ -702,7 +790,7 @@ async def text_handler(update, context):
         await update.message.reply_text(f"✅ Queued {emoji} reactions.")
         return
 
-    # ---- No state = show menu ----
+    # No state → show menu
     await main_menu(update, context)
 
 # ---------- /join COMMAND (Direct) ----------
@@ -710,27 +798,44 @@ async def text_handler(update, context):
 async def join_command(update, context):
     if len(context.args) != 3:
         await update.message.reply_text(
-            "❌ **Usage:** `/join <link> <delay_seconds> <count>`\n"
-            "Example: `/join https://t.me/+abc123 10 5`",
+            "❌ **Usage:** `/join <link> <delay> <count>`\n"
+            "• Use `all` in count to join with all accounts\n"
+            "Example: `/join https://t.me/+abc123 10 all`",
             parse_mode="Markdown"
         )
         return
     link = context.args[0]
     try:
         delay = int(context.args[1])
-        count = int(context.args[2])
-        if delay < 0 or count <= 0:
+        if delay < 0:
             raise ValueError
     except:
-        await update.message.reply_text("❌ Delay and count must be positive numbers.")
+        await update.message.reply_text("❌ Delay must be a positive number.")
         return
+
     total = await account_manager.get_active_sessions()
-    if count > total:
+    if context.args[2].lower() == "all":
         count = total
-    await task_queue.put((update, link, delay, count, update.message))
+    else:
+        try:
+            count = int(context.args[2])
+            if count <= 0:
+                raise ValueError
+            if count > total:
+                count = total
+        except:
+            await update.message.reply_text("❌ Count must be a positive number or `all`.")
+            return
+
+    uid = update.effective_user.id
+    await task_queue.put((update, uid, link, delay, count, update.message))
     if not is_processing:
         asyncio.create_task(process_join_queue())
-    await update.message.reply_text(f"✅ **Task queued!**\n{count} accounts joining with {delay}s delay.", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"✅ **Task queued!**\nAccounts: `{count}` | Delay: `{delay}s`",
+        parse_mode="Markdown",
+        reply_markup=cancel_keyboard()
+    )
 
 # ---------- Leave Commands ----------
 @authorized_only
@@ -739,7 +844,7 @@ async def leave_command(update, context):
         results = await account_manager.leave_specific(context.args[0])
     else:
         results = await account_manager.leave_all_channels()
-    await send_long_message(update, "\n".join(results))
+    await send_long(update, "\n".join(results))
 
 # ---------- Owner Commands ----------
 @owner_only
@@ -780,9 +885,11 @@ async def remove_admin_command(update, context):
     await remove_admin(int(context.args[0]))
     await update.message.reply_text("✅ Admin removed.")
 
+# ---------- /cancel COMMAND ----------
 async def cancel_command(update, context):
+    request_cancel(update.effective_user.id)
     await clear_state(update.effective_user.id)
-    await update.message.reply_text("❌ Cancelled.")
+    await update.message.reply_text("🛑 **Cancelled!**")
 
 # ---------- SETUP ----------
 async def setup_bot():
